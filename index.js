@@ -32,9 +32,25 @@ const imageSchema = new mongoose.Schema({
 
 const Image = mongoose.model('Image', imageSchema);
 
+const userSchema = new mongoose.Schema({
+    name: String,
+    email: String,
+    profileImage: { type: mongoose.Schema.Types.ObjectId, ref: 'Image' },
+});
+const User = mongoose.model('User', userSchema);
+
+const eventSchema = new mongoose.Schema({
+    title: String,
+    description: String,
+    // ssmultiple Image documents
+    eventImages: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Image' }], 
+  });
+  
+  const Event = mongoose.model('Event', eventSchema);
+
 const storage = multer.memoryStorage();
 
-const upload = multer({ storage });
+const upload = multer({ storage, limits : {fileSize: 16 * 1024 * 1024} });
 
 // Routes
 app.post('/upload', upload.single('image'), async (req, res) => {
@@ -147,6 +163,18 @@ app.put('/images/:id', upload.single('image'), async (req, res) => {
 app.get('/', (req, res) => {
     res.send('Welcome to the Image Upload Server!');
 });
+
+
+// Validating for file size
+app.use((err, req, res, next) => {
+    if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).json({ error: 'File size exceeds the 16 MB limit' });
+        }
+    }
+    next(err);
+  });
+  
 
 // Start Server
 app.listen(PORT, () => {
