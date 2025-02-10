@@ -1,19 +1,32 @@
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const path = require('path');
-const dotenv = require('dotenv');
-const fs = require('fs');
-
-dotenv.config();
+const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
 
 const app = express();
 const PORT = 5000;
+app.use(bodyParser.json());
 
 // Middleware
 app.use(bodyParser.json());
-app.use('/uploads', express.static(path.join(__dirname, '/uploads'))); // Serve uploaded images
+app.use('/uploads', express.static(path.join(__dirname, '/uploads'))); 
+
+// Configure AWS S3
+const s3 = new S3Client({
+    region: process.env.BUCKET_REGION,
+    credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY,
+        secretAccessKey: process.env.S3_SECRET_KEY,
+    },
+});
+
+const storage = multer.memoryStorage();
+const upload = multer({ storage, limits: { fileSize: 16 * 1024 * 1024 } });
+
 
 // MongoDB Connection
 mongoose
@@ -23,141 +36,116 @@ mongoose
 
 // Define a schema and model for image metadata
 const imageSchema = new mongoose.Schema({
-  filename: String,
-  contentType: String,
-  // Store the binary data as a Buffer
-  imageData: Buffer, 
-  uploadDate: { type: Date, default: Date.now },
+    filename: String,
+    url: String,
+    s3Key: String,
+    uploadDate: { type: Date, default: Date.now },
 });
 
 const Image = mongoose.model('Image', imageSchema);
 
-const userSchema = new mongoose.Schema({
-    name: String,
-    email: String,
-    profileImage: { type: mongoose.Schema.Types.ObjectId, ref: 'Image' },
-});
-const User = mongoose.model('User', userSchema);
-
-const eventSchema = new mongoose.Schema({
-    title: String,
-    description: String,
-    // ssmultiple Image documents
-    eventImages: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Image' }], 
-  });
-  
-  const Event = mongoose.model('Event', eventSchema);
-
-const storage = multer.memoryStorage();
-
-const upload = multer({ storage, limits : {fileSize: 16 * 1024 * 1024} });
-
 // Routes
 app.post('/upload', upload.single('image'), async (req, res) => {
-  try {
-      if (!req.file) {
-          return res.status(400).json({ error: 'No file uploaded' });
-      }
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
 
-      const { originalname, mimetype, buffer } = req.file;
+        const fileName = `uploads/${Date.now()}_${req.file.originalname}`;
 
-      // Create a new image document
-      const newImage = new Image({
-          filename: originalname,
-          contentType: mimetype,
-          imageData: buffer,
-      });
+        
+        const uploadParams = {
+            client: s3,
+            params: {
+                Bucket: process.env.BUCKET_NAME,
+                Key: fileName,
+                Body: req.file.buffer,
+                ContentType: req.file.mimetype,
+                // ACL: 'public-read',
+            },
+        };
 
-      // Save to MongoDB
-      await newImage.save();
+        const uploadTask = new Upload(uploadParams);
+        const uploadResult = await uploadTask.done();
 
-      res.status(201).json({
-          message: 'Image uploaded successfully',
-          image: {
-              id: newImage._id,
-              filename: newImage.filename,
-              contentType: newImage.contentType,
-          },
-      });
-  } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: 'Failed to upload image' });
-  }
+        // Get the uploaded S3 URL
+        const imageUrl = uploadResult.Location; 
+
+        // Save metadata in MongoDB
+        const newImage = new Image({ filename: req.file.originalname, url: imageUrl, s3Key: fileName });
+        await newImage.save();
+
+        res.status(201).json({ message: 'Image uploaded successfully', image: newImage });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to upload image' });
+    }
 });
 
 app.get('/images/:id', async (req, res) => {
-  try {
-      const { id } = req.params;
+    try {
+        const image = await Image.findById(req.params.id);
+        if (!image) return res.status(404).json({ error: 'Image not found' });
 
-      // Find the image by ID
-      const image = await Image.findById(id);
-      if (!image) {
-          return res.status(404).json({ error: 'Image not found' });
-      }
-
-      // Set the content type and send the image
-      res.set('Content-Type', image.contentType);
-      res.send(image.imageData);
-  } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: 'Failed to fetch image' });
-  }
+        // Redirect directly to the S3 URL
+        res.redirect(image.url);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to fetch image' });
+    }
 });
 
+
 app.delete('/images/:id', async (req, res) => {
-  try {
-      const { id } = req.params;
+    try {
+        const image = await Image.findById(req.params.id);
+        if (!image) return res.status(404).json({ error: 'Image not found' });
 
-      // Find the image by ID
-      const image = await Image.findById(id);
-      if (!image) {
-          return res.status(404).json({ error: 'Image not found' });
-      }
+        await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET_NAME, Key: image.s3Key }));
 
-      // Delete the image document from MongoDB
-      await Image.findByIdAndDelete(id);
-
-      res.status(200).json({ message: 'Image deleted successfully' });
-  } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: 'Failed to delete image' });
-  }
+        await Image.findByIdAndDelete(req.params.id);
+        res.status(200).json({ message: 'Image deleted successfully' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to delete image' });
+    }
 });
 
 app.put('/images/:id', upload.single('image'), async (req, res) => {
-  try {
-      const { id } = req.params;
+    try {
+        const { id } = req.params;
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-      if (!req.file) {
-          return res.status(400).json({ error: 'No file uploaded' });
-      }
+        const existingImage = await Image.findById(id);
+        if (!existingImage) return res.status(404).json({ error: 'Image not found' });
 
-      const { originalname, mimetype, buffer } = req.file;
+        // Delete old image from S3
+        await s3.send(new DeleteObjectCommand({ Bucket: process.env.BUCKET_NAME, Key: existingImage.s3Key }));
 
-      // Find the image by ID and update the binary data
-      const updatedImage = await Image.findByIdAndUpdate(
-          id,
-          {
-              filename: originalname,
-              contentType: mimetype,
-              imageData: buffer,
-          },
-           // Return the updated document
-          { new: true }
-      );
+        // Upload new image to S3
+        const newS3Key = `uploads/${Date.now()}_${req.file.originalname}`;
+        const uploadTask = new Upload({
+            client: s3,
+            params: {
+                Bucket: process.env.BUCKET_NAME,
+                Key: newS3Key,
+                Body: req.file.buffer,
+                ContentType: req.file.mimetype,
+                // ACL: 'public-read',
+            },
+        });
 
-      if (!updatedImage) {
-          return res.status(404).json({ error: 'Image not found' });
-      }
+        const uploadResult = await uploadTask.done();
+        const newImageUrl = uploadResult.Location;
 
-      res.status(200).json({
-          message: 'Image updated successfully',
-          image: updatedImage,
-      });
-  } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: 'Failed to update image' });
-  }
+        // Update MongoDB record
+        const updatedImage = await Image.findByIdAndUpdate(id, { filename: req.file.originalname, url: newImageUrl, s3Key: newS3Key }, { new: true });
+
+        res.status(200).json({ message: 'Image updated successfully', image: updatedImage });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to update image' });
+    }
 });
 
 app.get('/', (req, res) => {
